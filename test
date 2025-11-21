@@ -1,0 +1,172 @@
+import time
+import collections
+import numpy as np
+import cv2
+from scipy.signal import butter, filtfilt
+
+# Parameters
+WINDOW_SECONDS = 10          # length of signal buffer (seconds)
+MIN_SECONDS_FOR_EST = 6      # minimum seconds before estimating BPM
+BANDPASS_LOW = 0.7           # Hz (≈42 bpm)
+BANDPASS_HIGH = 4.0          # Hz (≈240 bpm)
+FACE_DETECT_EVERY_N = 5      # detect face every N frames for speed
+FRAME_W, FRAME_H = 640, 480  # requested camera resolution
+
+def bandpass_filter(sig, fs, low, high, order=3):
+    nyq = 0.5 * fs
+    lown = low / nyq
+    highn = high / nyq
+    b, a = butter(order, [lown := lown, highn], btype='band')
+    # filtfilt needs enough samples; caller should ensure length is sufficient
+    return filtfilt(b, a, sig)
+
+def estimate_bpm_fft(sig, times):
+    # sig: 1D numpy array, times: list of timestamps (s)
+    duration = times[-1] - times[0]
+    if duration <= 0:
+        return None
+    fs = len(sig) / duration
+    if fs <= 0:
+        return None
+    # detrend
+    sig = sig - np.mean(sig)
+    # bandpass
+    try:
+        filtered = bandpass_filter(sig, fs, BANDPASS_LOW, BANDPASS_HIGH)
+    except Exception:
+        return None
+    # FFT
+    n = len(filtered)
+    freqs = np.fft.rfftfreq(n, d=1.0/fs)
+    fft_mag = np.abs(np.fft.rfft(filtered))
+    # limit to HR band
+    mask = (freqs >= BANDPASS_LOW) & (freqs <= BANDPASS_HIGH)
+    if not np.any(mask):
+        return None
+    peak_idx = np.argmax(fft_mag[mask])
+    peak_freq = freqs[mask][peak_idx]
+    bpm = peak_freq * 60.0
+    return bpm
+
+def draw_waveform(frame, samples, height=80, color=(0,255,0)):
+    h, w = frame.shape[:2]
+    canvas = np.zeros((height, w, 3), dtype=np.uint8)
+    if len(samples) > 1:
+        arr = np.array(samples)
+        # normalize to 0..1
+        arr = arr - np.min(arr)
+        denom = np.ptp(arr) if np.ptp(arr) > 1e-6 else 1.0
+        arr = arr / denom
+        pts = []
+        for i, v in enumerate(arr):
+            x = int(i * w / max(1, len(arr)-1))
+            y = int((1.0 - v) * (height-1))
+            pts.append((x, y))
+        for i in range(1, len(pts)):
+            cv2.line(canvas, pts[i-1], pts[i], color, 1)
+    # paste at bottom of frame
+    frame[-height:, : ] = cv2.addWeighted(frame[-height:, :], 0.4, canvas, 0.6, 0)
+    return frame
+
+def main():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # cv2.CAP_DSHOW helps on Windows
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    if not cap.isOpened():
+        print("Cannot open camera")
+        return
+
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    samples = collections.deque()
+    times = collections.deque()
+    maxlen_frames = 3000  # prevent runaway
+    frame_count = 0
+    last_face = None
+    fps_est = 30.0
+
+    print("Starting camera. Press 'q' to quit.")
+
+    t_prev = time.time()
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_count += 1
+        t_now = time.time()
+        dt = t_now - t_prev
+        t_prev = t_now
+        # detect face occasionally
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if frame_count % FACE_DETECT_EVERY_N == 0 or last_face is None:
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80,80))
+            if len(faces) > 0:
+                # pick largest face
+                x,y,w,h = max(faces, key=lambda r: r[2]*r[3])
+                last_face = (x,y,w,h)
+        # draw face rect
+        if last_face is not None:
+            x,y,w,h = last_face
+            cv2.rectangle(frame, (x,y), (x+w, y+h), (255,0,0), 2)
+            # forehead ROI (adjust percentages if needed)
+            fx = x + int(w*0.25)
+            fw = int(w*0.5)
+            fy = y + int(h*0.08)
+            fh = int(h*0.18)
+            fx = max(0, fx); fy = max(0, fy)
+            fw = min(frame.shape[1]-fx, fw); fh = min(frame.shape[0]-fy, fh)
+            roi = frame[fy:fy+fh, fx:fx+fw]
+            if roi.size > 0:
+                cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (0,255,0), 1)
+                # use mean of green channel as PPG proxy
+                mean_g = float(np.mean(roi[:,:,1]))
+                samples.append(mean_g)
+                times.append(t_now)
+        else:
+            # no face -> append nothing (keeps previous signal)
+            pass
+
+        # keep buffer by seconds using timestamps
+        while len(times) >= 2 and (times[-1] - times[0]) > WINDOW_SECONDS:
+            samples.popleft()
+            times.popleft()
+        # estimate fps from timestamps
+        if len(times) >= 2:
+            fps_est = max(1.0, (len(times)-1) / (times[-1] - times[0]))
+
+        bpm = None
+        if len(times) >= 2 and (times[-1] - times[0]) >= MIN_SECONDS_FOR_EST:
+            try:
+                bpm = estimate_bpm_fft(np.array(samples), list(times))
+            except Exception:
+                bpm = None
+
+        # overlay BPM
+        if bpm is not None:
+            cv2.putText(frame, f"BPM: {bpm:.1f}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+        else:
+            cv2.putText(frame, "BPM: --", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+
+        # draw waveform from samples (downsample to width)
+        # convert samples deque to list and normalize for plotting
+        plot_samples = list(samples)
+        # optionally smooth small fluctuations
+        if len(plot_samples) > 0:
+            # simple moving average smoothing for plot
+            arr = np.array(plot_samples)
+            kernel = 3
+            if arr.size >= kernel:
+                arr = np.convolve(arr, np.ones(kernel)/kernel, mode='same')
+            plot_samples = arr.tolist()
+        draw_waveform(frame, plot_samples, height=100)
+
+        cv2.imshow("PPG Heart Rate Estimator (press q to quit)", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
