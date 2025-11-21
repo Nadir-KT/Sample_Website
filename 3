@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""
+Clinical Decision Timer - GE HealthCare Hack4Care
+A tool that helps doctors track time-sensitive protocols with smart alerts and documentation timestamps.
+Run with: python clinical_decision_timer.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import time
+import json
+import datetime
+from threading import Thread, Event
+import winsound  # For Windows alerts - remove if on other OS
+
+class ClinicalProtocol:
+    """Represents a clinical protocol with time-sensitive steps"""
+    def __init__(self, name, steps):
+        self.name = name
+        self.steps = steps  # List of (step_name, minutes_required)
+        self.start_time = None
+        self.completed_steps = {}
+        self.active = False
+
+class ClinicalDecisionTimer:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("GE HealthCare - Clinical Decision Timer")
+        self.root.geometry("1000x750")
+        self.root.configure(bg='#f0f8ff')
+        
+        # Initialize protocols database
+        self.protocols = self.load_protocols()
+        self.current_protocol = None
+        self.timer_thread = None
+        self.stop_timer = Event()
+        
+        self.setup_ui()
+        
+    def load_protocols(self):
+        """Load predefined clinical protocols"""
+        return {
+            "Sepsis Bundle": [
+                ("Measure Lactate", 180),
+                ("Blood Cultures", 180),
+                ("Broad-Spectrum Antibiotics", 60),
+                ("IV Fluids (30ml/kg)", 180),
+                ("Vasoactive Medications", 60)
+            ],
+            "Stroke Protocol": [
+                ("CT Scan Completion", 25),
+                ("CT Interpretation", 45),
+                ("Thrombolytics Decision", 60),
+                ("Thrombolytics Administration", 60),
+                ("NIHSS Re-assessment", 120)
+            ],
+            "STEMI Protocol": [
+                ("ECG Acquisition", 10),
+                ("Cardiology Consultation", 10),
+                ("Cath Lab Activation", 30),
+                ("Door-to-Balloon Time", 90),
+                ("ASA Administration", 30)
+            ],
+            "Trauma Activation": [
+                ("Primary Survey (ABCDE)", 5),
+                ("IV Access & Labs", 15),
+                ("FAST Ultrasound", 10),
+                ("Chest X-Ray", 15),
+                ("Definitive Care Decision", 60)
+            ],
+            "Code Blue": [
+                ("CPR Initiation", 1),
+                ("Defibrillation Ready", 3),
+                ("First Epinephrine", 5),
+                ("Advanced Airway", 8),
+                ("ROSC Assessment", 20)
+            ]
+        }
+    
+    def setup_ui(self):
+        # Header
+        header_frame = tk.Frame(self.root, bg='#0033a0', height=80)
+        header_frame.pack(fill=tk.X, padx=10, pady=10)
+        header_frame.pack_propagate(False)
+        
+        title_label = tk.Label(header_frame, text="🏥 GE Clinical Decision Timer", 
+                              font=('Arial', 20, 'bold'), fg='white', bg='#0033a0')
+        title_label.pack(pady=20)
+        
+        subtitle_label = tk.Label(header_frame, 
+                                 text="Time-Sensitive Protocol Tracking with Smart Alerts", 
+                                 font=('Arial', 12), fg='white', bg='#0033a0')
+        subtitle_label.pack()
+        
+        # Main content frame
+        main_frame = tk.Frame(self.root, bg='#f0f8ff')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Left panel - Protocol selection and controls
+        left_frame = tk.Frame(main_frame, bg='#f0f8ff')
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        
+        # Protocol selection
+        protocol_frame = tk.LabelFrame(left_frame, text="Select Clinical Protocol", 
+                                      font=('Arial', 12, 'bold'), bg='#f0f8ff', padx=10, pady=10)
+        protocol_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.protocol_var = tk.StringVar()
+        protocol_combo = ttk.Combobox(protocol_frame, textvariable=self.protocol_var, 
+                                     values=list(self.protocols.keys()), state='readonly')
+        protocol_combo.pack(fill=tk.X)
+        protocol_combo.bind('<<ComboboxSelected>>', self.on_protocol_select)
+        
+        # Patient info
+        patient_frame = tk.LabelFrame(left_frame, text="Patient Information", 
+                                     font=('Arial', 12, 'bold'), bg='#f0f8ff', padx=10, pady=10)
+        patient_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        tk.Label(patient_frame, text="MRN:", bg='#f0f8ff').pack(anchor=tk.W)
+        self.mrn_entry = tk.Entry(patient_frame)
+        self.mrn_entry.pack(fill=tk.X, pady=(0, 5))
+        
+        tk.Label(patient_frame, text="Patient Name:", bg='#f0f8ff').pack(anchor=tk.W)
+        self.name_entry = tk.Entry(patient_frame)
+        self.name_entry.pack(fill=tk.X, pady=(0, 5))
+        
+        # Control buttons
+        control_frame = tk.Frame(left_frame, bg='#f0f8ff')
+        control_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.start_btn = tk.Button(control_frame, text="Start Protocol", 
+                                  command=self.start_protocol, bg='#4CAF50', fg='white',
+                                  font=('Arial', 11, 'bold'))
+        self.start_btn.pack(fill=tk.X, pady=2)
+        
+        self.pause_btn = tk.Button(control_frame, text="Pause Timer", 
+                                  command=self.pause_protocol, bg='#FF9800', fg='white',
+                                  font=('Arial', 11))
+        self.pause_btn.pack(fill=tk.X, pady=2)
+        self.pause_btn.config(state=tk.DISABLED)
+        
+        self.complete_btn = tk.Button(control_frame, text="Complete Protocol", 
+                                     command=self.complete_protocol, bg='#2196F3', fg='white',
+                                     font=('Arial', 11))
+        self.complete_btn.pack(fill=tk.X, pady=2)
+        self.complete_btn.config(state=tk.DISABLED)
+        
+        # Current time display
+        time_frame = tk.LabelFrame(left_frame, text="Current Time", 
+                                  font=('Arial', 12, 'bold'), bg='#f0f8ff', padx=10, pady=10)
+        time_frame.pack(fill=tk.X)
+        
+        self.time_label = tk.Label(time_frame, text="00:00:00", font=('Arial', 16, 'bold'), 
+                                  bg='#f0f8ff', fg='#0033a0')
+        self.time_label.pack()
+        
+        # Right panel - Protocol tracking and documentation
+        right_frame = tk.Frame(main_frame, bg='#f0f8ff')
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Protocol progress
+        progress_frame = tk.LabelFrame(right_frame, text="Protocol Progress", 
+                                      font=('Arial', 12, 'bold'), bg='#f0f8ff', padx=10, pady=10)
+        progress_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create treeview for protocol steps
+        columns = ('Step', 'Time Required', 'Status', 'Completed At')
+        self.tree = ttk.Treeview(progress_frame, columns=columns, show='headings', height=12)
+        
+        # Define headings
+        self.tree.heading('Step', text='Clinical Step')
+        self.tree.heading('Time Required', text='Time Required (min)')
+        self.tree.heading('Status', text='Status')
+        self.tree.heading('Completed At', text='Completed At')
+        
+        self.tree.column('Step', width=200)
+        self.tree.column('Time Required', width=120)
+        self.tree.column('Status', width=100)
+        self.tree.column('Completed At', width=150)
+        
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        
+        # Step completion button
+        self.complete_step_btn = tk.Button(progress_frame, text="Mark Step Complete", 
+                                          command=self.complete_step, bg='#4CAF50', fg='white',
+                                          font=('Arial', 11))
+        self.complete_step_btn.pack(fill=tk.X, pady=(10, 0))
+        self.complete_step_btn.config(state=tk.DISABLED)
+        
+        # Documentation area
+        doc_frame = tk.LabelFrame(right_frame, text="Clinical Documentation", 
+                                 font=('Arial', 12, 'bold'), bg='#f0f8ff', padx=10, pady=10)
+        doc_frame.pack(fill=tk.BOTH, pady=(10, 0))
+        
+        self.doc_text = scrolledtext.ScrolledText(doc_frame, height=8, font=('Arial', 10))
+        self.doc_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Documentation buttons
+        doc_button_frame = tk.Frame(doc_frame, bg='#f0f8ff')
+        doc_button_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        tk.Button(doc_button_frame, text="Add Timestamp", 
+                 command=self.add_timestamp, bg='#2196F3', fg='white').pack(side=tk.LEFT, padx=(0, 5))
+        
+        tk.Button(doc_button_frame, text="Clear Documentation", 
+                 command=self.clear_documentation).pack(side=tk.LEFT)
+        
+        tk.Button(doc_button_frame, text="Save Documentation", 
+                 command=self.save_documentation, bg='#4CAF50', fg='white').pack(side=tk.RIGHT)
+        
+        # Start clock update
+        self.update_clock()
+    
+    def update_clock(self):
+        """Update the current time display"""
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
+        self.time_label.config(text=current_time)
+        self.root.after(1000, self.update_clock)
+    
+    def on_protocol_select(self, event):
+        """When a protocol is selected from dropdown"""
+        protocol_name = self.protocol_var.get()
+        if protocol_name in self.protocols:
+            self.load_protocol_steps(protocol_name)
+    
+    def load_protocol_steps(self, protocol_name):
+        """Load protocol steps into the treeview"""
+        # Clear existing items
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Add new steps
+        steps = self.protocols[protocol_name]
+        for i, (step_name, minutes) in enumerate(steps):
+            self.tree.insert('', 'end', values=(
+                step_name, 
+                f"{minutes} min", 
+                "Pending", 
+                ""
+            ))
+    
+    def start_protocol(self):
+        """Start the selected protocol timer"""
+        if not self.protocol_var.get():
+            messagebox.showwarning("No Protocol", "Please select a clinical protocol first!")
+            return
+        
+        if not self.mrn_entry.get() or not self.name_entry.get():
+            messagebox.showwarning("Missing Info", "Please enter patient MRN and name!")
+            return
+        
+        # Create protocol instance
+        protocol_name = self.protocol_var.get()
+        self.current_protocol = ClinicalProtocol(
+            protocol_name, 
+            self.protocols[protocol_name]
+        )
+        self.current_protocol.start_time = datetime.datetime.now()
+        self.current_protocol.active = True
+        
+        # Update UI
+        self.start_btn.config(state=tk.DISABLED)
+        self.pause_btn.config(state=tk.NORMAL)
+        self.complete_btn.config(state=tk.NORMAL)
+        self.complete_step_btn.config(state=tk.NORMAL)
+        
+        # Add start note to documentation
+        self.doc_text.insert(tk.END, 
+            f"\n=== {protocol_name} STARTED ===\n"
+            f"Patient: {self.name_entry.get()} (MRN: {self.mrn_entry.get()})\n"
+            f"Start Time: {self.current_protocol.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Protocol Steps:\n"
+        )
+        
+        for step_name, minutes in self.protocols[protocol_name]:
+            self.doc_text.insert(tk.END, f"  - {step_name} ({minutes} minutes)\n")
+        
+        self.doc_text.insert(tk.END, "="*50 + "\n")
+        
+        # Start timer thread
+        self.stop_timer.clear()
+        self.timer_thread = Thread(target=self.run_timer)
+        self.timer_thread.daemon = True
+        self.timer_thread.start()
+        
+        messagebox.showinfo("Protocol Started", 
+                           f"{protocol_name} timer started!\n\n"
+                           f"Patient: {self.name_entry.get()}\n"
+                           f"Start Time: {self.current_protocol.start_time.strftime('%H:%M:%S')}")
+    
+    def run_timer(self):
+        """Background timer that checks for alerts"""
+        while self.current_protocol and self.current_protocol.active and not self.stop_timer.is_set():
+            current_time = datetime.datetime.now()
+            elapsed = (current_time - self.current_protocol.start_time).total_seconds()
+            
+            # Check each step for time alerts
+            for i, (step_name, minutes_required) in enumerate(self.current_protocol.steps):
+                step_key = f"{step_name}_{i}"
+                
+                # If step not completed and time is running out
+                if step_key not in self.current_protocol.completed_steps:
+                    time_remaining = (minutes_required * 60) - elapsed
+                    
+                    # Alert for critical time (last 5 minutes or 25% of time remaining)
+                    alert_threshold = min(300, minutes_required * 60 * 0.25)  # 5 min or 25%
+                    
+                    if 0 < time_remaining <= alert_threshold:
+                        # Visual alert in UI (thread-safe using after)
+                        self.root.after(0, self.show_step_alert, step_name, time_remaining)
+            
+            time.sleep(1)  # Check every second
+    
+    def show_step_alert(self, step_name, time_remaining):
+        """Show alert for step time running out"""
+        minutes = int(time_remaining // 60)
+        seconds = int(time_remaining % 60)
+        
+        # Update treeview with warning
+        for item in self.tree.get_children():
+            values = self.tree.item(item)['values']
+            if values[0] == step_name:
+                self.tree.set(item, 'Status', f"⚠️ {minutes}:{seconds:02d} left")
+                break
+        
+        # Sound alert (Windows only - remove if cross-platform needed)
+        try:
+            winsound.Beep(1000, 500)  # Frequency, duration
+        except:
+            pass  # Skip sound on non-Windows systems
+        
+        # Flash window (optional)
+        self.root.attributes('-topmost', 1)
+        self.root.attributes('-topmost', 0)
+    
+    def complete_step(self):
+        """Mark the selected step as complete"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a step to mark complete!")
+            return
+        
+        item = selection[0]
+        values = self.tree.item(item)['values']
+        step_name = values[0]
+        
+        # Update protocol completion
+        step_index = self.tree.index(item)
+        step_key = f"{step_name}_{step_index}"
+        completion_time = datetime.datetime.now()
+        
+        self.current_protocol.completed_steps[step_key] = completion_time
+        
+        # Update treeview
+        self.tree.set(item, 'Status', "✅ Completed")
+        self.tree.set(item, 'Completed At', completion_time.strftime("%H:%M:%S"))
+        
+        # Add to documentation
+        elapsed = (completion_time - self.current_protocol.start_time).total_seconds()
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        
+        self.doc_text.insert(tk.END, 
+            f"[{completion_time.strftime('%H:%M:%S')}] "
+            f"COMPLETED: {step_name} "
+            f"(Elapsed: {minutes}:{seconds:02d})\n"
+        )
+        
+        # Check if all steps are completed
+        all_completed = len(self.current_protocol.completed_steps) == len(self.current_protocol.steps)
+        if all_completed:
+            self.complete_protocol()
+    
+    def pause_protocol(self):
+        """Pause or resume the protocol timer"""
+        if self.current_protocol:
+            if self.current_protocol.active:
+                # Pause
+                self.current_protocol.active = False
+                self.pause_btn.config(text="Resume Timer", bg='#4CAF50')
+                
+                self.doc_text.insert(tk.END, 
+                    f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
+                    f"PROTOCOL PAUSED\n"
+                )
+            else:
+                # Resume
+                self.current_protocol.active = True
+                self.pause_btn.config(text="Pause Timer", bg='#FF9800')
+                
+                self.doc_text.insert(tk.END, 
+                    f"[{datetime.datetime.now().strftime('%H:%M:%S')}] "
+                    f"PROTOCOL RESUMED\n"
+                )
+    
+    def complete_protocol(self):
+        """Complete the entire protocol"""
+        if self.current_protocol:
+            completion_time = datetime.datetime.now()
+            elapsed = (completion_time - self.current_protocol.start_time).total_seconds()
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            
+            # Stop timer thread
+            self.stop_timer.set()
+            self.current_protocol.active = False
+            
+            # Update UI
+            self.start_btn.config(state=tk.NORMAL)
+            self.pause_btn.config(state=tk.DISABLED)
+            self.complete_btn.config(state=tk.DISABLED)
+            self.complete_step_btn.config(state=tk.DISABLED)
+            
+            # Add completion note
+            self.doc_text.insert(tk.END, 
+                f"\n=== PROTOCOL COMPLETED ===\n"
+                f"Total Time: {minutes}:{seconds:02d}\n"
+                f"Completion Time: {completion_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Steps Completed: {len(self.current_protocol.completed_steps)}/{len(self.current_protocol.steps)}\n"
+                f"==================================\n"
+            )
+            
+            messagebox.showinfo("Protocol Complete", 
+                               f"{self.current_protocol.name} completed!\n\n"
+                               f"Total Time: {minutes}:{seconds:02d}\n"
+                               f"All steps documented with timestamps.")
+    
+    def add_timestamp(self):
+        """Add a timestamp to the documentation"""
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
+        self.doc_text.insert(tk.END, f"[{current_time}] ")
+        self.doc_text.see(tk.END)
+    
+    def clear_documentation(self):
+        """Clear the documentation area"""
+        if messagebox.askyesno("Clear Documentation", "Are you sure you want to clear all documentation?"):
+            self.doc_text.delete('1.0', tk.END)
+    
+    def save_documentation(self):
+        """Save documentation to file"""
+        if not self.current_protocol:
+            messagebox.showwarning("No Active Protocol", "No protocol data to save!")
+            return
+        
+        # Create filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"clinical_timer_{self.mrn_entry.get()}_{timestamp}.txt"
+        
+        try:
+            with open(filename, 'w') as f:
+                f.write("GE HealthCare - Clinical Decision Timer Report\n")
+                f.write("="*50 + "\n\n")
+                f.write(f"Patient: {self.name_entry.get()}\n")
+                f.write(f"MRN: {self.mrn_entry.get()}\n")
+                f.write(f"Protocol: {self.current_protocol.name}\n")
+                f.write(f"Start Time: {self.current_protocol.start_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                
+                f.write("PROTOCOL STEPS:\n")
+                for i, (step_name, minutes) in enumerate(self.current_protocol.steps):
+                    step_key = f"{step_name}_{i}"
+                    if step_key in self.current_protocol.completed_steps:
+                        status = f"COMPLETED at {self.current_protocol.completed_steps[step_key].strftime('%H:%M:%S')}"
+                    else:
+                        status = "NOT COMPLETED"
+                    f.write(f"  {i+1}. {step_name} ({minutes} min) - {status}\n")
+                
+                f.write("\nCLINICAL DOCUMENTATION:\n")
+                f.write("="*50 + "\n")
+                f.write(self.doc_text.get('1.0', tk.END))
+            
+            messagebox.showinfo("Save Successful", f"Documentation saved as:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not save file:\n{str(e)}")
+
+def main():
+    try:
+        root = tk.Tk()
+        app = ClinicalDecisionTimer(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Error starting application: {e}")
+        print("Please ensure you have Python installed")
+
+if __name__ == "__main__":
+    main()
